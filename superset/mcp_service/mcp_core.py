@@ -34,6 +34,15 @@ F = TypeVar("F", bound=BaseModel)  # For filter types
 L = TypeVar("L", bound=BaseModel)  # For list response schemas
 
 
+def _rollback_db_session() -> None:
+    try:
+        from superset.extensions import db
+
+        db.session.rollback()
+    except Exception:
+        return
+
+
 class BaseCore(ABC):
     """
     Abstract base class for all MCP Core classes.
@@ -365,6 +374,7 @@ class InstanceInfoCore(BaseCore):
             try:
                 counts[f"total_{entity_name}"] = dao_class.count()
             except Exception as e:
+                _rollback_db_session()
                 self._log_warning(f"Failed to count {entity_name}: {e}")
                 counts[f"total_{entity_name}"] = 0
         return counts
@@ -421,6 +431,7 @@ class InstanceInfoCore(BaseCore):
                         window_metrics[f"{entity_name}_modified"] = modified_count
 
                 except Exception as e:
+                    _rollback_db_session()
                     self._log_warning(
                         f"Failed to calculate {window_name} metrics for "
                         f"{entity_name}: {e}"
@@ -450,6 +461,7 @@ class InstanceInfoCore(BaseCore):
                 if result is not None:
                     custom_metrics[metric_name] = result
             except Exception as e:
+                _rollback_db_session()
                 self._log_warning(f"Failed to calculate {metric_name}: {e}")
                 # Don't add failed metrics to avoid validation errors
 

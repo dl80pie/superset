@@ -37,6 +37,15 @@ from superset.mcp_service.system.schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _rollback_db_session() -> None:
+    try:
+        from superset.extensions import db
+
+        db.session.rollback()
+    except Exception:
+        return
+
+
 def calculate_dashboard_breakdown(
     base_counts: Dict[str, int],
     time_metrics: Dict[str, Dict[str, int]],
@@ -83,6 +92,7 @@ def calculate_dashboard_breakdown(
             without_charts=dashboards_without_charts,
         )
     except Exception:
+        _rollback_db_session()
         # Return empty breakdown on error
         return DashboardBreakdown(
             published=0,
@@ -119,6 +129,7 @@ def calculate_database_breakdown(
 
         return DatabaseBreakdown(by_type=type_counts)
     except Exception:
+        _rollback_db_session()
         # Return empty breakdown on error
         return DatabaseBreakdown(by_type={})
 
@@ -155,6 +166,7 @@ def calculate_instance_summary(
             avg_charts_per_dashboard=round(avg_charts_per_dashboard, 2),
         )
     except Exception:
+        _rollback_db_session()
         # Return empty summary on error
         return InstanceSummary(
             total_dashboards=0,

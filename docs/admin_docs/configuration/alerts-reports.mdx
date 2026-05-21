@@ -44,6 +44,12 @@ In Superset versions &lt;=4.0x, users installed Firefox or Chrome and that was d
 
 Only the worker container needs the browser.
 
+For UBI/RHEL-based images, install browser dependencies in the worker image at build time. Example:
+
+```dockerfile
+RUN dnf -y install firefox geckodriver && dnf clean all
+```
+
 ### Slack integration
 
 To send alerts and reports to Slack channels, you need to create a new Slack Application on your workspace.

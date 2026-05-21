@@ -1,0 +1,184 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+ARG BUILD_TRANSLATIONS="false"
+
+######################################################################
+# superset-node-ci used as a base for building frontend assets
+######################################################################
+FROM registry.access.redhat.com/ubi9/ubi:latest AS superset-node-ci
+ARG NODEJS_VERSION=20.19.2
+ARG BUILD_TRANSLATIONS
+ENV BUILD_TRANSLATIONS=${BUILD_TRANSLATIONS}
+ARG DEV_MODE="false"
+ENV DEV_MODE=${DEV_MODE}
+ARG NPM_BUILD_CMD="build"
+
+COPY docker/ /app/docker/
+
+USER root
+RUN dnf -y install \
+      ca-certificates \
+      gcc \
+      gcc-c++ \
+      make \
+      python3 \
+      zstd \
+    && dnf module enable nodejs:22 -y \
+    && dnf install -y nodejs npm \
+    && node --version \
+    && npm --version \
+    && dnf clean all
+
+ENV BUILD_CMD=${NPM_BUILD_CMD} \
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
+RUN /app/docker/frontend-mem-nag.sh
+
+WORKDIR /app/superset-frontend
+
+RUN mkdir -p /app/superset/static/assets \
+             /app/superset/translations
+
+RUN --mount=type=bind,source=./superset-frontend/package.json,target=./package.json \
+    --mount=type=bind,source=./superset-frontend/package-lock.json,target=./package-lock.json \
+    --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/root/.npm \
+    if [ "${DEV_MODE}" = "false" ]; then \
+        npm ci; \
+    else \
+        echo "Skipping 'npm ci' in dev mode"; \
+    fi
+
+COPY superset-frontend /app/superset-frontend
+
+######################################################################
+# superset-node is used for compiling frontend assets
+######################################################################
+FROM superset-node-ci AS superset-node
+
+RUN --mount=type=cache,target=/root/.npm \
+    if [ "${DEV_MODE}" = "false" ]; then \
+        echo "Running 'npm run ${BUILD_CMD}'"; \
+        npm run ${BUILD_CMD}; \
+    else \
+        echo "Skipping 'npm run ${BUILD_CMD}' in dev mode"; \
+    fi
+
+COPY superset/translations /app/superset/translations
+
+RUN if [ "${BUILD_TRANSLATIONS}" = "true" ]; then \
+        npm run build-translation; \
+    fi; \
+    rm -rf /app/superset/translations/*/*/*.[po,mo]
+
+######################################################################
+# UBI9 python runtime layer
+######################################################################
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+ARG IMAGE_VERSION=6.0.0
+ARG SUPERSET_PY_VERSION=6.0.0
+LABEL org.opencontainers.image.version="${IMAGE_VERSION}"
+
+USER root
+
+RUN dnf -y update && \
+    dnf -y install \
+      python3.11 \
+      python3.11-pip \
+      python3.11-devel \
+      make \
+      gcc \
+      gcc-c++ \
+      curl-minimal \
+      cyrus-sasl-devel \
+      cyrus-sasl-gssapi \
+      libffi-devel \
+      openldap-devel \
+      openssl-devel \
+      postgresql-devel \
+      findutils \
+    && dnf clean all
+
+WORKDIR /app
+
+COPY . /app
+
+RUN python3.11 -c "import json; p='/app/superset-frontend/package.json'; d=json.load(open(p)); d['version']='${SUPERSET_PY_VERSION}'; open(p, 'w').write(json.dumps(d, indent=2) + '\\n')"
+
+RUN mkdir -p /app/superset/static && \
+    touch /app/superset/static/version_info.json
+
+COPY --from=superset-node /app/superset/static/assets /app/superset/static/assets
+COPY --from=superset-node /app/superset/static/service-worker.js /app/superset/static/service-worker.js
+COPY --from=superset-node /app/superset/translations /app/superset/translations
+
+RUN python3.11 -m venv /app/.venv && \
+    /app/.venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel uv && \
+    /app/.venv/bin/python setup.py bdist_wheel && \
+    WHEEL_FILE="$(find /app/dist -maxdepth 1 -type f -name '*.whl' | head -n 1)" && \
+    test -n "$WHEEL_FILE" && \
+    /app/.venv/bin/python -m pip install --no-cache-dir "$WHEEL_FILE" && \
+    /app/.venv/bin/python -m pip install --no-cache-dir /app/superset-core && \
+    /app/.venv/bin/python -m pip install --no-cache-dir "cachetools" && \
+    /app/.venv/bin/python -m pip install --no-cache-dir "pymysql" && \
+    /app/.venv/bin/python -c "import importlib.metadata as m; v=m.version('apache-superset'); print('apache-superset version:', v); assert v == '${SUPERSET_PY_VERSION}', f'expected ${SUPERSET_PY_VERSION}, got {v}'" && \
+    rm -rf /app/build /app/dist /app/*.egg-info /app/pyproject.toml /app/setup.py
+
+ENV PATH=/app/.venv/bin:${PATH} \
+    SUPERSET_HOME=/app/superset_home \
+    HOME=/app/superset_home \
+    SUPERSET_ENV=production \
+    PYTHONPATH=/app/pythonpath \
+    FLASK_APP=superset.app:create_app() \
+    SUPERSET_PORT=8088
+
+RUN mkdir -p /app/superset_home /app/pythonpath && \
+    chown -R 1001:0 /app && \
+    chmod -R g=u /app
+
+RUN cat <<'EOF' >/usr/local/bin/run-superset.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${SUPERSET_DB_UPGRADE:-true}" = "true" ]; then
+  superset db upgrade
+fi
+
+if [ "${SUPERSET_CREATE_ADMIN:-false}" = "true" ]; then
+  superset fab create-admin \
+    --username "${SUPERSET_ADMIN_USERNAME:-admin}" \
+    --firstname "${SUPERSET_ADMIN_FIRSTNAME:-Superset}" \
+    --lastname "${SUPERSET_ADMIN_LASTNAME:-Admin}" \
+    --email "${SUPERSET_ADMIN_EMAIL:-admin@superset.local}" \
+    --password "${SUPERSET_ADMIN_PASSWORD:-admin}" || true
+fi
+
+superset init
+exec /app/docker/entrypoints/run-server.sh
+EOF
+
+RUN chmod +x /usr/local/bin/run-superset.sh
+
+HEALTHCHECK CMD /app/docker/docker-healthcheck.sh
+
+EXPOSE 8088
+
+USER 1001
+
+CMD ["/usr/local/bin/run-superset.sh"]
